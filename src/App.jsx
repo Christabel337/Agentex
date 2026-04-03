@@ -410,6 +410,10 @@ export default function App() {
       // 1. Get the Manager's Public Key (hardcoded for backend-controlled account)
       const managerPubKey = "GBRPYHIL2CI3WHZDTOOQFC6EB4KJJGUJQDP7DC3VAEX2DRKCLNJOHBW"; // Your backend manager public key
       
+      // Fund the manager account via Friendbot
+      addLog("stellar", "Funding manager account via Friendbot...");
+      await friendbot(managerPubKey);
+      
       // 2. Setup agent wallets (these stay random/temp for the demo)
       const kps = {};
       const current = loadAgents();
