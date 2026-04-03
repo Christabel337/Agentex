@@ -144,6 +144,14 @@ function AgentCard({ cfg, keypair, hired, earned, isActive }) {
   );
 }
 
+function Tag({ color, children }) {
+  return (
+    <span style={{ background: color, color: '#000', padding: '2px 6px', borderRadius: 4, fontSize: 10, fontWeight: 600 }}>
+      {children}
+    </span>
+  );
+}
+
 function LogLine({ log, agents }) {
   const cfg = agents.find(a => a.id === log.agentId);
   const TYPE_COLORS = { manager: "#9CA3AF", hire: "#F59E0B", tx: "#4ADE80", work: "#60A5FA", done: "#4ADE80", error: "#F87171", stellar: "#A78BFA", x402: "#E879F9" };
@@ -152,8 +160,12 @@ function LogLine({ log, agents }) {
   return (
     <div style={{ display: "flex", gap: 10, padding: "5px 0", borderBottom: "1px solid #ffffff08", fontSize: 12 }}>
       <span style={{ color: "#444", flexShrink: 0, fontFamily: "var(--font-mono)" }}>{log.t}</span>
-      <span style={{ color, flexShrink: 0 }}>{ICON_MAP[log.type] || "▸"}</span>
-      <span style={{ color: "#c0c0c0", wordBreak: "break-all" }}>{log.msg}</span>
+      <span style={{ color: "var(--accent)", flexShrink: 0 }}>{log.type === 'manager' ? '🧠' : '🤖'}</span>
+      <span style={{ color: "#c0c0c0", wordBreak: "break-all" }}>
+        {log.msg}
+        {/* Highlight the Reasoning in the UI */}
+        {log.msg.includes("Selected") && <div style={{ fontSize: '10px', color: '#666', marginTop: '2px', fontStyle: 'italic' }}>Verified Skill Match ✅</div>}
+      </span>
     </div>
   );
 }
@@ -453,173 +465,182 @@ export default function App() {
     setAgentKPs(p => { const n = {...p}; delete n[id]; return n; });
   };
 
+  const executeAgentTask = async (cfg, instruction, gathered) => {
+    setActive(cfg.id);
+    setHired(p => [...p, cfg.id]);
+
+    // Build user message with previous context
+    const prevContext = Object.entries(gathered)
+      .map(([id, result]) => {
+        const prev = agents.find(a => a.id === id);
+        return `${prev?.label || id}:\n${result}`;
+      }).join("\n\n");
+    const userMsg = prevContext
+      ? `${instruction}\n\nPrevious agents outputs:\n${prevContext}`
+      : instruction;
+
+    // ── x402 Step 1: Probe agent endpoint → expect 402 ──────────────────
+    addLog("x402", `Probing ${cfg.label} endpoint...`, cfg.id);
+    await sleep(300);
+
+    const probeRes = await fetch("/api/agents", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        agentId: cfg.id,
+        task: userMsg,
+        agentPublicKey: agentKPs[cfg.id].publicKey(),
+        system: cfg.system,
+        price: cfg.price,
+      }),
+    });
+
+    if (probeRes.status !== 402) {
+      throw new Error(`Expected 402 from ${cfg.label}, got ${probeRes.status}`);
+    }
+    const probeData = await probeRes.json();
+    addLog("x402", `← 402 Payment Required · ${probeData.amount} XLM · ${abbr(probeData.destination)}`, cfg.id);
+    await sleep(400);
+
+    // ── x402 Step 2: Make Stellar payment ───────────────────────────────
+    addLog("tx", `Requesting backend manager payment to ${abbr(agentKPs[cfg.id].publicKey())}...`, cfg.id);
+    const payRes = await fetch("/api/pay", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        destination: agentKPs[cfg.id].publicKey(),
+        amount: cfg.price,
+      }),
+    });
+
+    if (!payRes.ok) {
+      const payErr = await payRes.json().catch(() => ({}));
+      throw new Error(payErr.error?.message || "Manager payment failed");
+    }
+
+    const { hash } = await payRes.json();
+    setTxs(p => [...p, { hash, agentId: cfg.id, amount: cfg.price }]);
+
+    const newBal = await getBalance(managerKP.publicKey());
+    setManagerBal(newBal);
+    addLog("tx", `Payment confirmed on-chain · ${hash.slice(0,16)}...`, cfg.id);
+    await sleep(500);
+
+    // ── x402 Step 3: Retry with payment proof → agent executes task ─────
+    addLog("x402", `Retrying with payment proof · awaiting 200 OK...`, cfg.id);
+
+    const taskRes = await fetch("/api/agents", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Payment-Hash": hash,
+      },
+      body: JSON.stringify({
+        agentId: cfg.id,
+        task: userMsg,
+        agentPublicKey: agentKPs[cfg.id].publicKey(),
+        system: cfg.system,
+        price: cfg.price,
+      }),
+    });
+
+    const taskData = await taskRes.json();
+    if (!taskRes.ok) throw new Error(taskData.error?.message || `${cfg.label} task failed`);
+
+    addLog("done", `← 200 OK · ${cfg.label} task complete`, cfg.id);
+    await sleep(300);
+
+    return taskData.result;
+  };
+
+  const agentList = agents.map(a => 
+    `- id:"${a.id}" name:"${a.label}" skill:"${a.desc}" price:${a.price}XLM`
+  ).join("\n");
+
+  const managerSystemPrompt = `
+You are the Strategic Router for an Open Agent Marketplace. 
+Your goal: Solve the user's task by hiring the most SPECIFIC specialists available.
+
+AGENT EVALUATION RULES:
+1. SPECIALIST PREFERENCE: If two agents could do a task, always hire the one with the most niche/specific description. (e.g., "Math specialist" beats "General AI").
+2. ANTI-CAMPING GUARDRAIL: If an agent's description is too broad (e.g., "I can do everything", "I am the best"), deprioritize them. Only hire them if no specialist exists.
+3. FRUGALITY: If the user just says "Hi" or asks a question that requires no external tools, DO NOT hire anyone. Respond directly.
+4. BUDGET: Do not hire more than 3 agents unless the task is extremely complex.
+
+CURRENT REGISTRY (Dynamic):
+${agentList}
+
+RESPONSE FORMAT (JSON ONLY):
+{
+  "intent": "direct" | "hire",
+  "directResponse": "Message if direct",
+  "assignments": [
+    { "agentId": "ID", "instruction": "Task", "reasoning": "Why this agent was picked" }
+  ],
+  "requiresSummary": true/false
+}
+`;
+
   // ── run task ───────────────────────────────────────────────────────────────
   const run = async () => {
     if (!task.trim() || running || walletStatus !== "ready") return;
     setRunning(true);
-    setLogs([]); setTxs([]);
-    setHired([]); setActive(null); setResults(null);
-    const sessionEarned = {};
+    setLogs([]); setTxs([]); setHired([]); setActive(null); setResults(null);
 
     try {
-      addLog("manager", "Manager Agent online — analyzing task and available agents...");
-      await sleep(400);
+      addLog("manager", "Scanning registry for specialists...");
 
-      const agentList = agents.map(a => 
-        `- id:"${a.id}" name:"${a.label}" skill:"${a.desc}" price:${a.price}XLM`
-      ).join("\n");
+      const raw = await callClaude(managerSystemPrompt, `User Request: "${task}"`);
+      const decision = JSON.parse(raw.replace(/```json|```/g, "").trim());
 
-      const managerSystemPrompt = `
-You are the Orchestrator Agent. Your goal is to solve the user's request using the LEAST amount of money possible.
-1. Analyze the user's task.
-2. Select ONLY the specific agents from the list below that are absolutely necessary.
-3. If one agent can do the whole task, hire only that one.
-4. If agents are redundant, pick the cheaper or more relevant one.
-5. Return ONLY a JSON object with an "assignments" array.
+      // 1. GREETING / TRIVIAL FILTER
+      if (decision.intent === "direct") {
+        addLog("manager", "Direct response (No agent hired to save XLM).");
+        setResults({ manager: decision.directResponse });
+        setTab("manager");
+        setRunning(false);
+        return;
+      }
 
-Available Agents:
-${agentList}
-
-JSON Format:
-{
-  "assignments": [
-    { "agentId": "agent_id_here", "instruction": "specific sub-task for this agent" }
-  ]
-}
-`;
-
-      const raw = await callClaude(managerSystemPrompt, `Task: "${task}"`);
-
-      let assignments = agents.map(a => ({ agentId: a.id, instruction: `Complete this task using your specialty: ${task}` }));
-      try {
-        const parsed = JSON.parse(raw.replace(/```json|```/g, "").trim());
-        if (Array.isArray(parsed.assignments) && parsed.assignments.length > 0) {
-          assignments = parsed.assignments;
-        }
-      } catch {}
-
-      addLog("manager", `Delegation plan ready — ${assignments.length} agents to hire.`);
-      await sleep(400);
-
+      // 2. TARGETED SPECIALIST HIRING
       const gathered = {};
+      let wordCount = 0;
 
-      for (const { agentId, instruction } of assignments) {
-        const cfg = agents.find(a => a.id === agentId);
-        if (!cfg || !agentKPs[agentId]) continue;
-
-        setActive(agentId);
-        setHired(p => [...p, agentId]);
-
-        // Build user message with previous context
-        const prevContext = Object.entries(gathered)
-          .map(([id, result]) => {
-            const prev = agents.find(a => a.id === id);
-            return `${prev?.label || id}:\n${result}`;
-          }).join("\n\n");
-        const userMsg = prevContext
-          ? `${instruction}\n\nPrevious agents outputs:\n${prevContext}`
-          : instruction;
-
-        // ── x402 Step 1: Probe agent endpoint → expect 402 ──────────────────
-        addLog("x402", `Probing ${cfg.label} endpoint...`, agentId);
-        await sleep(300);
-
-        const probeRes = await fetch("/api/agents", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            agentId,
-            task: userMsg,
-            agentPublicKey: agentKPs[agentId].publicKey(),
-            system: cfg.system,
-            price: cfg.price,
-          }),
-        });
-
-        if (probeRes.status !== 402) {
-          throw new Error(`Expected 402 from ${cfg.label}, got ${probeRes.status}`);
-        }
-        const probeData = await probeRes.json();
-        addLog("x402", `← 402 Payment Required · ${probeData.amount} XLM · ${abbr(probeData.destination)}`, agentId);
-        await sleep(400);
-
-        // ── x402 Step 2: Make Stellar payment ───────────────────────────────
-        addLog("tx", `Requesting backend manager payment to ${abbr(agentKPs[agentId].publicKey())}...`, agentId);
-        const payRes = await fetch("/api/pay", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            destination: agentKPs[agentId].publicKey(),
-            amount: cfg.price,
-          }),
-        });
-
-        if (!payRes.ok) {
-          const payErr = await payRes.json().catch(() => ({}));
-          throw new Error(payErr.error?.message || "Manager payment failed");
-        }
-
-        const { hash } = await payRes.json();
-        setTxs(p => [...p, { hash, agentId, amount: cfg.price }]);
-        sessionEarned[agentId] = (sessionEarned[agentId] || 0) + cfg.price;
-        setEarned({...sessionEarned});
-
-        const newBal = await getBalance(managerKP.publicKey());
-        setManagerBal(newBal);
-        addLog("tx", `Payment confirmed on-chain · ${hash.slice(0,16)}...`, agentId);
-        await sleep(500);
-
-        // ── x402 Step 3: Retry with payment proof → agent executes task ─────
-        addLog("x402", `Retrying with payment proof · awaiting 200 OK...`, agentId);
-
-        const taskRes = await fetch("/api/agents", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "X-Payment-Hash": hash,
-          },
-          body: JSON.stringify({
-            agentId,
-            task: userMsg,
-            agentPublicKey: agentKPs[agentId].publicKey(),
-            system: cfg.system,
-            price: cfg.price,
-          }),
-        });
-
-        const taskData = await taskRes.json();
-        if (!taskRes.ok) throw new Error(taskData.error?.message || `${cfg.label} task failed`);
-
-        gathered[agentId] = taskData.result;
-        addLog("done", `← 200 OK · ${cfg.label} task complete`, agentId);
-        await sleep(300);
-      }
-
-      setActive(null);
-      setResults(gathered);
-      const lastId = assignments[assignments.length - 1]?.agentId;
-      setTab(lastId || agents[agents.length - 1]?.id);
-
-      // Update leaderboard
-      const newBoard = { ...loadBoard() };
-      for (const [id, amt] of Object.entries(sessionEarned)) {
-        const cfg = agents.find(a => a.id === id);
+      for (const job of decision.assignments) {
+        const cfg = agents.find(a => a.id === job.agentId);
         if (!cfg) continue;
-        if (!newBoard[id]) newBoard[id] = { label: cfg.label, icon: cfg.icon, accent: cfg.accent, earned: 0, tasks: 0 };
-        newBoard[id].earned = +(newBoard[id].earned + amt).toFixed(2);
-        newBoard[id].tasks += 1;
-        newBoard[id].icon   = cfg.icon;
-        newBoard[id].accent = cfg.accent;
+
+        addLog("manager", `Selected ${cfg.label} because: ${job.reasoning}`, job.agentId);
+        
+        // Standard execution logic (payment + x402 call)
+        const result = await executeAgentTask(cfg, job.instruction, gathered);
+        gathered[cfg.id] = result;
+        wordCount += result.split(/\s+/).length;
       }
-      setBoard(newBoard);
-      saveBoard(newBoard);
 
-      const totalSpent = Object.values(sessionEarned).reduce((s, v) => s + v, 0);
-      addLog("manager", `Network complete — ${Object.keys(sessionEarned).length} agents paid · ${totalSpent} XLM on-chain.`);
+      // 3. THE "INTELLIGENT SUMMARY" CHECK
+      // We only trigger a summary if we have multiple inputs or long context
+      const hasMultiple = Object.keys(gathered).length > 1;
+      const isLong = wordCount > 200;
 
-    } catch(e) {
-      addLog("error", e.message);
-      setActive(null);
+      if (decision.requiresSummary && (hasMultiple || isLong)) {
+         addLog("manager", `Context length: ${wordCount} words. Hiring Summary Specialist...`);
+         
+         // Dynamically find the best summary agent in the registry
+         const summaryAgent = agents.find(a => a.id === 'summary' || a.desc.toLowerCase().includes('summary'));
+         
+         if (summaryAgent) {
+           const summary = await executeAgentTask(summaryAgent, "Synthesize these results.", gathered);
+           gathered['final_report'] = summary;
+         }
+      }
+
+      setResults(gathered);
+      setTab(Object.keys(gathered).pop());
+      addLog("manager", "Task complete. Market successfully navigated.");
+
+    } catch (e) {
+      addLog("error", `Market Error: ${e.message}`);
     }
     setRunning(false);
   };
@@ -633,92 +654,30 @@ JSON Format:
   ];
 
   return (
-    <div style={{
-      minHeight: "100vh", background: "#050505",
-      fontFamily: "'IBM Plex Mono','Fira Code',var(--font-mono),monospace",
-      color: "#e0e0e0", padding: "24px 20px 60px",
-    }}>
-      <style>{`
-        @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&display=swap');
-        @keyframes shimmer { 0% { background-position: -200% 0; } 100% { background-position: 200% 0; } }
+    <div style={{ padding: "0 20px 120px" }}>
 
-        .glass-panel {
-          background: rgba(255, 255, 255, 0.03);
-          backdrop-filter: blur(10px);
-          border: 1px solid rgba(255, 255, 255, 0.1);
-          border-radius: 16px;
-          box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.37);
-        }
-
-        .bento-grid {
-          display: grid;
-          grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
-          gap: 16px;
-          margin-bottom: 24px;
-        }
-
-        input {
-          background: rgba(10, 10, 10, 0.8) !important;
-          border: 1px solid rgba(255, 255, 255, 0.1) !important;
-          color: #fff !important;
-          box-shadow: inset 0 2px 4px rgba(0,0,0,0.5);
-        }
-
-        .agent-card-glow {
-          position: relative;
-          overflow: hidden;
-        }
-
-        .agent-card-glow::before {
-          content: "";
-          position: absolute;
-          top: -50%; left: -50%;
-          width: 200%; height: 200%;
-          background: radial-gradient(circle, rgba(74, 222, 128, 0.1) 0%, transparent 70%);
-          opacity: 0;
-          transition: opacity 0.3s;
-        }
-
-        .agent-card-glow:hover::before {
-          opacity: 1;
-        }
-
-        button {
-          background: linear-gradient(135deg, #4ADE80 0%, #2DD4BF 100%) !important;
-          color: #000 !important;
-          border: none !important;
-          font-weight: 700 !important;
-          box-shadow: 0 4px 14px 0 rgba(74, 222, 128, 0.39);
-        }
-      `}</style>
 
       <div style={{ maxWidth: 900, margin: "0 auto" }}>
 
-        {/* header */}
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 20 }}>
+        {/* TOP HEADER & STATUS PILL */}
+        <header style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "24px 0" }}>
           <div>
-            <div style={{ fontSize: 11, color: "#A78BFA", letterSpacing: "0.15em", marginBottom: 6, fontWeight: 600 }}>
-              STELLAR TESTNET · REAL ON-CHAIN PAYMENTS
-            </div>
-            <h1 style={{ margin: 0, fontSize: 22, fontWeight: 600, color: "#f0f0f0", letterSpacing: "-0.02em" }}>
-              Agent Marketplace
+            <h1 style={{ fontSize: 18, margin: 0, fontWeight: 700, letterSpacing: "-0.03em" }}>
+              AGENT<span style={{ color: "var(--accent)" }}>MARKET</span>
             </h1>
-            <p style={{ margin: "4px 0 0", fontSize: 12, color: "#555" }}>
-              Hire AI agents · Pay on Stellar · Register your own
-            </p>
           </div>
-
-          <div style={{ border: "1px solid #1a1a1a", borderRadius: 10, padding: "12px 16px", background: "#0a0a0a", textAlign: "right", minWidth: 185 }}>
-            <div style={{ fontSize: 10, color: "#444", marginBottom: 4, letterSpacing: "0.1em" }}>MANAGER WALLET</div>
-            <div style={{ fontSize: 10, color: "#333", marginBottom: 6, fontFamily: "var(--font-mono)" }}>
-              {managerKP ? abbr(managerKP.publicKey()) : "not generated"}
-            </div>
-            <div style={{ fontSize: 20, fontWeight: 600, color: walletStatus === "ready" ? "#4ADE80" : "#555" }}>
-              {managerBal !== null ? `${managerBal.toFixed(4)} XLM` : "——"}
-            </div>
-            {totalSpent > 0 && <div style={{ fontSize: 10, color: "#F87171", marginTop: 2 }}>-{totalSpent} XLM spent</div>}
+          
+          <div className="status-pill">
+            <div className="status-dot"></div>
+            <span style={{ color: "#666" }}>{managerKP ? abbr(managerKP.publicKey()) : "OFFLINE"}</span>
+            <span style={{ color: "var(--accent)", fontWeight: 600 }}>
+              {managerBal !== null ? `${managerBal.toFixed(2)} XLM` : "0.00"}
+            </span>
+            <button onClick={setupWallets} style={{ background: "none", border: "none", color: "#fff", cursor: "pointer", fontSize: 10, padding: 0, opacity: 0.5 }}>
+              ↻
+            </button>
           </div>
-        </div>
+        </header>
 
         {/* nav */}
         <div style={{ borderBottom: "1px solid #111", marginBottom: 20, display: "flex" }}>
