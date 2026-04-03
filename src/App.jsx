@@ -13,19 +13,20 @@ async function friendbot(pk) {
   if (!r.ok) throw new Error(`Friendbot failed: ${pk.slice(0,8)}`);
 }
 
-async function stellarPay(fromKP, toPK, amount) {
-  const acct = await server.loadAccount(fromKP.publicKey());
-  const fee  = await server.fetchBaseFee();
-  const tx   = new StellarSdk.TransactionBuilder(acct, { fee, networkPassphrase: NETWORK })
-    .addOperation(StellarSdk.Operation.payment({
-      destination: toPK,
-      asset:  StellarSdk.Asset.native(),
-      amount: amount.toFixed(7),
-    }))
-    .setTimeout(30).build();
-  tx.sign(fromKP);
-  const res = await server.submitTransaction(tx);
-  return res.hash;
+async function stellarPay(toPK, amount) {
+  const response = await fetch('/api/pay', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ 
+      destination: toPK, 
+      amount: amount.toFixed(7) 
+    }),
+  });
+
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.error || "Payment failed");
+  
+  return data.hash; // Returns the transaction hash to the frontend
 }
 
 async function getBalance(pk) {
@@ -477,7 +478,7 @@ export default function App() {
 
     // 3. Pay on Stellar
     addLog("tx", `Paying ${cfg.label} ${cfg.price} XLM...`, cfg.id);
-    const hash = await stellarPay(managerKP, agentKPs[cfg.id].publicKey(), cfg.price);
+    const hash = await stellarPay(agentKPs[cfg.id].publicKey(), cfg.price);
     setTxs(p => [...p, { hash, agentId: cfg.id, amount: cfg.price }]);
 
     // 4. Execute with Hash
@@ -489,7 +490,6 @@ export default function App() {
 
     const data = await taskRes.json();
     addLog("done", `${cfg.label} task complete.`, cfg.id);
-    return data.result;
   };
 
   const agentList = agents.map(a => 
