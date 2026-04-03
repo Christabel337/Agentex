@@ -144,14 +144,6 @@ function AgentCard({ cfg, keypair, hired, earned, isActive }) {
   );
 }
 
-function Tag({ color, children }) {
-  return (
-    <span style={{ background: color, color: '#000', padding: '2px 6px', borderRadius: 4, fontSize: 10, fontWeight: 600 }}>
-      {children}
-    </span>
-  );
-}
-
 function LogLine({ log, agents }) {
   const cfg = agents.find(a => a.id === log.agentId);
   const TYPE_COLORS = { manager: "#9CA3AF", hire: "#F59E0B", tx: "#4ADE80", work: "#60A5FA", done: "#4ADE80", error: "#F87171", stellar: "#A78BFA", x402: "#E879F9" };
