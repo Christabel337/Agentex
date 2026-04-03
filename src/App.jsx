@@ -461,92 +461,35 @@ export default function App() {
     setAgentKPs(p => { const n = {...p}; delete n[id]; return n; });
   };
 
-  const executeAgentTask = async (cfg, instruction, gathered) => {
-    setActive(cfg.id);
-    setHired(p => [...p, cfg.id]);
+  const executeAgentTask = async (cfg, instruction, context) => {
+    // 1. Prepare context
+    const prevContext = Object.entries(context)
+      .map(([id, res]) => `${agents.find(a => a.id === id)?.label || id}:\n${res}`)
+      .join("\n\n");
+    const userMsg = prevContext ? `${instruction}\n\nContext:\n${prevContext}` : instruction;
 
-    // Build user message with previous context
-    const prevContext = Object.entries(gathered)
-      .map(([id, result]) => {
-        const prev = agents.find(a => a.id === id);
-        return `${prev?.label || id}:\n${result}`;
-      }).join("\n\n");
-    const userMsg = prevContext
-      ? `${instruction}\n\nPrevious agents outputs:\n${prevContext}`
-      : instruction;
-
-    // ── x402 Step 1: Probe agent endpoint → expect 402 ──────────────────
-    addLog("x402", `Probing ${cfg.label} endpoint...`, cfg.id);
-    await sleep(300);
-
+    // 2. Probe x402
     const probeRes = await fetch("/api/agents", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        agentId: cfg.id,
-        task: userMsg,
-        agentPublicKey: agentKPs[cfg.id].publicKey(),
-        system: cfg.system,
-        price: cfg.price,
-      }),
+      body: JSON.stringify({ agentId: cfg.id, task: userMsg, agentPublicKey: agentKPs[cfg.id].publicKey(), system: cfg.system, price: cfg.price })
     });
 
-    if (probeRes.status !== 402) {
-      throw new Error(`Expected 402 from ${cfg.label}, got ${probeRes.status}`);
-    }
-    const probeData = await probeRes.json();
-    addLog("x402", `← 402 Payment Required · ${probeData.amount} XLM · ${abbr(probeData.destination)}`, cfg.id);
-    await sleep(400);
-
-    // ── x402 Step 2: Make Stellar payment ───────────────────────────────
-    addLog("tx", `Requesting backend manager payment to ${abbr(agentKPs[cfg.id].publicKey())}...`, cfg.id);
-    const payRes = await fetch("/api/pay", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        destination: agentKPs[cfg.id].publicKey(),
-        amount: cfg.price,
-      }),
-    });
-
-    if (!payRes.ok) {
-      const payErr = await payRes.json().catch(() => ({}));
-      throw new Error(payErr.error?.message || "Manager payment failed");
-    }
-
-    const { hash } = await payRes.json();
+    // 3. Pay on Stellar
+    addLog("tx", `Paying ${cfg.label} ${cfg.price} XLM...`, cfg.id);
+    const hash = await stellarPay(managerKP, agentKPs[cfg.id].publicKey(), cfg.price);
     setTxs(p => [...p, { hash, agentId: cfg.id, amount: cfg.price }]);
 
-    const newBal = await getBalance(managerKP.publicKey());
-    setManagerBal(newBal);
-    addLog("tx", `Payment confirmed on-chain · ${hash.slice(0,16)}...`, cfg.id);
-    await sleep(500);
-
-    // ── x402 Step 3: Retry with payment proof → agent executes task ─────
-    addLog("x402", `Retrying with payment proof · awaiting 200 OK...`, cfg.id);
-
+    // 4. Execute with Hash
     const taskRes = await fetch("/api/agents", {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Payment-Hash": hash,
-      },
-      body: JSON.stringify({
-        agentId: cfg.id,
-        task: userMsg,
-        agentPublicKey: agentKPs[cfg.id].publicKey(),
-        system: cfg.system,
-        price: cfg.price,
-      }),
+      headers: { "Content-Type": "application/json", "X-Payment-Hash": hash },
+      body: JSON.stringify({ agentId: cfg.id, task: userMsg, agentPublicKey: agentKPs[cfg.id].publicKey(), system: cfg.system, price: cfg.price })
     });
 
-    const taskData = await taskRes.json();
-    if (!taskRes.ok) throw new Error(taskData.error?.message || `${cfg.label} task failed`);
-
-    addLog("done", `← 200 OK · ${cfg.label} task complete`, cfg.id);
-    await sleep(300);
-
-    return taskData.result;
+    const data = await taskRes.json();
+    addLog("done", `${cfg.label} task complete.`, cfg.id);
+    return data.result;
   };
 
   const agentList = agents.map(a => 
@@ -582,58 +525,86 @@ RESPONSE FORMAT (JSON ONLY):
     if (!task.trim() || running || walletStatus !== "ready") return;
     setRunning(true);
     setLogs([]); setTxs([]); setHired([]); setActive(null); setResults(null);
+    
+    // Track earnings for THIS specific session
+    const sessionEarned = {};
 
     try {
-      addLog("manager", "Scanning registry for specialists...");
+      addLog("manager", "Analyzing task and searching for specialists...");
 
       const raw = await callClaude(managerSystemPrompt, `User Request: "${task}"`);
       const decision = JSON.parse(raw.replace(/```json|```/g, "").trim());
 
-      // 1. GREETING / TRIVIAL FILTER
       if (decision.intent === "direct") {
-        addLog("manager", "Direct response (No agent hired to save XLM).");
+        addLog("manager", "Handled directly (0 XLM spent).");
         setResults({ manager: decision.directResponse });
         setTab("manager");
         setRunning(false);
         return;
       }
 
-      // 2. TARGETED SPECIALIST HIRING
       const gathered = {};
       let wordCount = 0;
 
-      for (const job of decision.assignments) {
+      // --- FIX 1: Filter out any 'summary' agent from the initial assignments ---
+      // We only want specialists first. Summary comes last.
+      const specialists = decision.assignments.filter(a => a.agentId !== 'summary');
+
+      for (const job of specialists) {
         const cfg = agents.find(a => a.id === job.agentId);
         if (!cfg) continue;
 
-        addLog("manager", `Selected ${cfg.label} because: ${job.reasoning}`, job.agentId);
+        setActive(cfg.id);
+        setHired(p => [...p, cfg.id]);
+        addLog("manager", `Hiring ${cfg.label}...`, cfg.id);
         
-        // Standard execution logic (payment + x402 call)
+        // Execute and track payment
         const result = await executeAgentTask(cfg, job.instruction, gathered);
         gathered[cfg.id] = result;
+        
+        // Update session earnings tracker
+        sessionEarned[cfg.id] = (sessionEarned[cfg.id] || 0) + cfg.price;
         wordCount += result.split(/\s+/).length;
       }
 
-      // 3. THE "INTELLIGENT SUMMARY" CHECK
-      // We only trigger a summary if we have multiple inputs or long context
-      const hasMultiple = Object.keys(gathered).length > 1;
-      const isLong = wordCount > 200;
-
-      if (decision.requiresSummary && (hasMultiple || isLong)) {
-         addLog("manager", `Context length: ${wordCount} words. Hiring Summary Specialist...`);
+      // --- FIX 2: Conditional Summary (Ensures only ONE summary call) ---
+      const summaryAgent = agents.find(a => a.id === 'summary' || a.desc.toLowerCase().includes('summary'));
+      
+      if (decision.requiresSummary && wordCount > 200 && summaryAgent) {
+         setActive(summaryAgent.id);
+         setHired(p => [...p, summaryAgent.id]);
+         addLog("manager", `Generating report (${wordCount} words context)...`);
+         const summary = await executeAgentTask(summaryAgent, "Synthesize these results.", gathered);
+         gathered['summary'] = summary;
          
-         // Dynamically find the best summary agent in the registry
-         const summaryAgent = agents.find(a => a.id === 'summary' || a.desc.toLowerCase().includes('summary'));
-         
-         if (summaryAgent) {
-           const summary = await executeAgentTask(summaryAgent, "Synthesize these results.", gathered);
-           gathered['final_report'] = summary;
-         }
+         // Track summary payment
+         sessionEarned[summaryAgent.id] = (sessionEarned[summaryAgent.id] || 0) + summaryAgent.price;
       }
 
       setResults(gathered);
       setTab(Object.keys(gathered).pop());
-      addLog("manager", "Task complete. Market successfully navigated.");
+
+      // --- FIX 3: Leaderboard Persistence (Merge with LocalStorage) ---
+      const currentBoard = loadBoard(); // Load latest from LS
+      const updatedBoard = { ...currentBoard };
+
+      for (const [agentId, amount] of Object.entries(sessionEarned)) {
+        const cfg = agents.find(a => a.id === agentId);
+        if (!cfg) continue;
+
+        if (!updatedBoard[agentId]) {
+          updatedBoard[agentId] = { label: cfg.label, icon: cfg.icon, accent: cfg.accent, earned: 0, tasks: 0 };
+        }
+        
+        updatedBoard[agentId].earned = Number((updatedBoard[agentId].earned + amount).toFixed(2));
+        updatedBoard[agentId].tasks += 1;
+      }
+
+      // Save to state AND localStorage immediately
+      setBoard(updatedBoard);
+      saveBoard(updatedBoard); 
+
+      addLog("manager", "Market session finalized. All payments confirmed.");
 
     } catch (e) {
       addLog("error", `Market Error: ${e.message}`);
