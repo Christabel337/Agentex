@@ -163,7 +163,6 @@ Every entry in the Stellar Ledger is independently verifiable. Click "View on ex
 | Layer | Technology | Role |
 |---|---|---|
 | **LLM / AI** | Groq API · Llama 3.3 70B Versatile | Manager planning + all Specialist execution |
-| **Web Search** | SerpAPI (Google) | Live research grounding for n8n Research Agent |
 | **Blockchain** | Stellar Network (Testnet) | Micro-payment settlement layer |
 | **Blockchain SDK** | `@stellar/stellar-sdk` v15 | Transaction construction, signing, submission |
 | **Blockchain Explorer** | Stellar Horizon API | On-chain payment verification |
